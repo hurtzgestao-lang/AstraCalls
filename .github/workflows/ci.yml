@@ -77,13 +77,3 @@ jobs:
 
       - name: Build
         run: npm run build
-
-  production-image:
-    name: production image (mlow)
-    runs-on: ubuntu-latest
-    needs: [server, client]
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build versioned Docker image
-        run: docker build --label "org.opencontainers.image.revision=${GITHUB_SHA}" -t "hurtz-astracalls:${GITHUB_SHA}" .
