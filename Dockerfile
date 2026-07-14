@@ -38,7 +38,7 @@ RUN go build -tags mlow -o /wacalls ./cmd/server
 
 # ---------- Stage 4: runtime enxuto ----------
 FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=opus /opt/libopus_mlow.so /usr/local/lib/libopus_mlow.so
 RUN ldconfig
@@ -47,4 +47,4 @@ COPY --from=client /app/client/dist /app/client/dist
 WORKDIR /app
 EXPOSE 8080 50000
 ENTRYPOINT ["wacalls"]
-CMD ["-addr", ":8080", "-static", "/app/client/dist", "-db", "/data/wacalls.db"]
+CMD ["-addr", ":8080", "-static", "/app/client/dist"]

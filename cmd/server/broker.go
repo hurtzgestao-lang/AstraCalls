@@ -17,15 +17,17 @@ const (
 )
 
 type CallRecord struct {
-	SessionID string     `json:"sessionId"`
-	CallID    string     `json:"callId"`
-	Owner     *string    `json:"owner"`
-	Direction string     `json:"direction"`
-	Peer      string     `json:"peer"`
-	StartedAt int64      `json:"startedAt"`
-	Status    CallStatus `json:"status"`
-	EndedAt   *int64     `json:"endedAt,omitempty"`
-	EndReason string     `json:"endReason,omitempty"`
+	SessionID   string     `json:"sessionId"`
+	CallID      string     `json:"callId"`
+	Owner       *string    `json:"owner"`
+	Direction   string     `json:"direction"`
+	Peer        string     `json:"peer"`
+	Phone       string     `json:"phone,omitempty"`
+	StartedAt   int64      `json:"startedAt"`
+	ConnectedAt *int64     `json:"connectedAt,omitempty"`
+	Status      CallStatus `json:"status"`
+	EndedAt     *int64     `json:"endedAt,omitempty"`
+	EndReason   string     `json:"endReason,omitempty"`
 }
 
 type AuthSnapshot struct {
@@ -224,8 +226,6 @@ func (b *Broker) serveSSE(w http.ResponseWriter, r *http.Request, clientID strin
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
 	sub := b.subscribe(clientID)
 	defer b.unsubscribe(sub)
 

@@ -225,16 +225,21 @@ func (s *server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var b struct {
-		URL string `json:"url"`
+		URL    string   `json:"url"`
+		Secret string   `json:"secret"`
+		Events []string `json:"events"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url required"})
 		return
 	}
-	url := strings.TrimSpace(b.URL)
-	sess.setWebhook(url)
-	_ = sess.mgr.store.setWebhook(r.Context(), sess.id, url)
-	writeJSON(w, http.StatusOK, map[string]string{"webhook": url})
+	config := WebhookConfig{URL: strings.TrimSpace(b.URL), Secret: b.Secret, Events: b.Events}
+	if config.Secret == "" {
+		config.Secret = sess.getWebhook().Secret
+	}
+	sess.setWebhook(config)
+	_ = sess.mgr.store.setWebhook(r.Context(), sess.id, config.storedValue())
+	writeJSON(w, http.StatusOK, map[string]any{"webhook": config.URL, "events": config.Events})
 }
 
 func (s *server) handleGetWebhook(w http.ResponseWriter, r *http.Request) {
@@ -242,7 +247,8 @@ func (s *server) handleGetWebhook(w http.ResponseWriter, r *http.Request) {
 	if sess == nil {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"webhook": sess.getWebhook()})
+	config := sess.getWebhook()
+	writeJSON(w, http.StatusOK, map[string]any{"webhook": config.URL, "events": config.Events, "signed": config.Secret != ""})
 }
 
 func (s *server) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
@@ -250,7 +256,7 @@ func (s *server) handleDeleteWebhook(w http.ResponseWriter, r *http.Request) {
 	if sess == nil {
 		return
 	}
-	sess.setWebhook("")
+	sess.setWebhook(WebhookConfig{})
 	_ = sess.mgr.store.setWebhook(r.Context(), sess.id, "")
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -143,7 +143,7 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 		s := newSession(m, row.ID, row.Name, client)
 		s.waContainer = container
 		s.waDB = db
-		s.setWebhook(row.Webhook)
+		s.setWebhook(parseStoredWebhook(row.Webhook))
 		if row.Chatwoot != "" {
 			var cfg ChatwootConfig
 			if json.Unmarshal([]byte(row.Chatwoot), &cfg) == nil {

@@ -39,17 +39,17 @@ type Session struct {
 
 	mu       sync.Mutex
 	auth     AuthSnapshot
-	webhook  string
+	webhook  WebhookConfig
 	chatwoot ChatwootConfig
 }
 
-func (s *Session) setWebhook(url string) {
+func (s *Session) setWebhook(config WebhookConfig) {
 	s.mu.Lock()
-	s.webhook = url
+	s.webhook = config
 	s.mu.Unlock()
 }
 
-func (s *Session) getWebhook() string {
+func (s *Session) getWebhook() WebhookConfig {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.webhook
@@ -90,14 +90,17 @@ func (s *Session) createCall(callID string) *call.CallManager {
 
 func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	cm.OnIncoming = func(c *call.CallInfo) {
-		s.mgr.broker.upsertCall(CallRecord{
+		record := CallRecord{
 			SessionID: s.id, CallID: c.CallID, Direction: "inbound", Peer: c.PeerJid,
-			StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
-		})
+			Phone: digitsOnly(c.CallerPn), StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
+		}
+		s.mgr.broker.upsertCall(record)
 		s.mgr.broker.emitIncoming(s.id, c.CallID, c.PeerJid)
+		s.dispatchCallWebhook("call.incoming", record)
 	}
 	cm.OnStateChange = func(c *call.CallInfo) {
 		if c.IsEnded() {
+			s.dispatchCallEnded(c.CallID, string(c.StateData.EndReason))
 			s.removeCall(c.CallID)
 			s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
 			return
@@ -114,10 +117,24 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		if existing != nil {
 			rec.Owner = existing.Owner
 			rec.StartedAt = existing.StartedAt
+			rec.ConnectedAt = existing.ConnectedAt
+			rec.Phone = existing.Phone
+		}
+		if rec.Status == StatusConnected && rec.ConnectedAt == nil {
+			now := time.Now().UnixMilli()
+			rec.ConnectedAt = &now
 		}
 		s.mgr.broker.upsertCall(rec)
+		if existing == nil || existing.Status != rec.Status {
+			event := "call.ringing"
+			if rec.Status == StatusConnected {
+				event = "call.connected"
+			}
+			s.dispatchCallWebhook(event, rec)
+		}
 	}
 	cm.OnEnded = func(c *call.CallInfo) {
+		s.dispatchCallEnded(c.CallID, string(c.StateData.EndReason))
 		s.removeCall(c.CallID)
 		s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
 	}

@@ -16,6 +16,8 @@ import (
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /readyz", s.handleReady)
 	mux.HandleFunc("GET /api/config", s.handleConfig)
 	mux.HandleFunc("GET /api/sessions", s.handleSessionList)
 	mux.HandleFunc("POST /api/sessions", s.handleSessionCreate)
@@ -30,24 +32,26 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("DELETE /api/sessions/{sid}/calls/{id}", s.handleEndCall)
 	mux.HandleFunc("GET /api/sessions/{sid}/history", s.handleHistory)
 
-	// Mensageria (whatsmeow)
-	mux.HandleFunc("POST /api/sessions/{sid}/messages/text", s.handleSendText)
-	mux.HandleFunc("POST /api/sessions/{sid}/messages/image", s.handleSendImage)
-	mux.HandleFunc("POST /api/sessions/{sid}/messages/audio", s.handleSendAudio)
-	mux.HandleFunc("POST /api/sessions/{sid}/messages/video", s.handleSendVideo)
-	mux.HandleFunc("POST /api/sessions/{sid}/messages/document", s.handleSendDocument)
+	if envBool("WACALLS_ENABLE_MESSAGES", true) {
+		mux.HandleFunc("POST /api/sessions/{sid}/messages/text", s.handleSendText)
+		mux.HandleFunc("POST /api/sessions/{sid}/messages/image", s.handleSendImage)
+		mux.HandleFunc("POST /api/sessions/{sid}/messages/audio", s.handleSendAudio)
+		mux.HandleFunc("POST /api/sessions/{sid}/messages/video", s.handleSendVideo)
+		mux.HandleFunc("POST /api/sessions/{sid}/messages/document", s.handleSendDocument)
+	}
 
 	// Webhook por sessão (recebimento -> Chatwoot etc.)
 	mux.HandleFunc("POST /api/sessions/{sid}/webhook", s.handleSetWebhook)
 	mux.HandleFunc("GET /api/sessions/{sid}/webhook", s.handleGetWebhook)
 	mux.HandleFunc("DELETE /api/sessions/{sid}/webhook", s.handleDeleteWebhook)
 
-	// Integração Chatwoot por sessão
-	mux.HandleFunc("POST /api/sessions/{sid}/chatwoot", s.handleSetChatwoot)
-	mux.HandleFunc("GET /api/sessions/{sid}/chatwoot", s.handleGetChatwoot)
-	mux.HandleFunc("DELETE /api/sessions/{sid}/chatwoot", s.handleDeleteChatwoot)
-	mux.HandleFunc("POST /api/sessions/{sid}/chatwoot/webhook", s.handleChatwootWebhook)
-	mux.HandleFunc("GET /api/chatwoot/resolve", s.handleChatwootResolve)
+	if envBool("WACALLS_ENABLE_CHATWOOT_MESSAGES", true) {
+		mux.HandleFunc("POST /api/sessions/{sid}/chatwoot", s.handleSetChatwoot)
+		mux.HandleFunc("GET /api/sessions/{sid}/chatwoot", s.handleGetChatwoot)
+		mux.HandleFunc("DELETE /api/sessions/{sid}/chatwoot", s.handleDeleteChatwoot)
+		mux.HandleFunc("POST /api/sessions/{sid}/chatwoot/webhook", s.handleChatwootWebhook)
+		mux.HandleFunc("GET /api/chatwoot/resolve", s.handleChatwootResolve)
+	}
 
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 
@@ -60,12 +64,34 @@ func (s *server) routes() http.Handler {
 	if key := os.Getenv("WACALLS_API_KEY"); key != "" {
 		handler = withAuth(handler, key)
 	}
-	return withCORS(handler)
+	return withCORS(handler, os.Getenv("WACALLS_ALLOWED_ORIGINS"))
 }
 
-func withCORS(h http.Handler) http.Handler {
+func envBool(key string, defaultValue bool) bool {
+	value := strings.TrimSpace(os.Getenv(key))
+	if value == "" {
+		return defaultValue
+	}
+	return strings.EqualFold(value, "true") || value == "1"
+}
+
+func withCORS(h http.Handler, rawOrigins string) http.Handler {
+	allowed := map[string]bool{}
+	for _, origin := range strings.Split(rawOrigins, ",") {
+		if origin = strings.TrimSpace(origin); origin != "" {
+			allowed[origin] = true
+		}
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := r.Header.Get("Origin")
+		if origin != "" && !allowed[origin] {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "origin not allowed"})
+			return
+		}
+		if origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		}
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Client-Id, X-API-Key")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
@@ -77,12 +103,11 @@ func withCORS(h http.Handler) http.Handler {
 }
 
 // withAuth protege as rotas /api/* com uma API key (header X-API-Key ou ?apiKey=).
-// Exceções: o webhook do Chatwoot (chamado externamente pelo próprio Chatwoot)
-// e os arquivos estáticos do painel (precisam carregar a tela de login).
+// Os arquivos estáticos do painel permanecem públicos; toda a API é protegida.
 func withAuth(h http.Handler, key string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		guarded := strings.HasPrefix(p, "/api/") && !strings.HasSuffix(p, "/chatwoot/webhook")
+		guarded := strings.HasPrefix(p, "/api/")
 		if guarded {
 			got := r.Header.Get("X-API-Key")
 			if got == "" {
@@ -95,6 +120,18 @@ func withAuth(h http.Handler, key string) http.Handler {
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+func (s *server) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *server) handleReady(w http.ResponseWriter, r *http.Request) {
+	if err := s.sessions.store.db.PingContext(r.Context()); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ready", "sessions": len(s.sessions.infos())})
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -251,8 +288,11 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 	}
 	s.broker.upsertCall(CallRecord{
 		SessionID: sess.id, CallID: callID, Owner: &owner, Direction: "outbound", Peer: peer.String(),
-		StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
+		Phone: peer.User, StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
 	})
+	if record, ok := s.broker.getCall(callID); ok {
+		sess.dispatchCallWebhook("call.ringing", *record)
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"call": map[string]string{"callId": callID}})
 }
 
@@ -315,6 +355,11 @@ func (s *server) doAccept(sess *Session, w http.ResponseWriter, r *http.Request)
 		return
 	}
 	s.broker.emitIncomingClaimed(sess.id, id, owner)
+	if record, found := s.broker.getCall(id); found {
+		record.Owner = &owner
+		s.broker.upsertCall(*record)
+		sess.dispatchCallWebhook("call.claimed", *record)
+	}
 	if err := ac.cm.AcceptCall(r.Context(), id); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -327,6 +372,7 @@ func (s *server) doReject(sess *Session, w http.ResponseWriter, r *http.Request)
 	if ac, ok := sess.reg.get(id); ok {
 		_ = ac.cm.RejectCall(r.Context(), id, core.EndCallReasonDeclined)
 	}
+	sess.dispatchCallEnded(id, string(core.EndCallReasonDeclined))
 	sess.removeCall(id)
 	s.broker.endCall(id, string(core.EndCallReasonDeclined))
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -337,6 +383,7 @@ func (s *server) doEndCall(sess *Session, w http.ResponseWriter, r *http.Request
 	if ac, ok := sess.reg.get(id); ok {
 		_ = ac.cm.EndCall(r.Context(), core.EndCallReasonUserEnded)
 	}
+	sess.dispatchCallEnded(id, string(core.EndCallReasonUserEnded))
 	sess.removeCall(id)
 	s.broker.endCall(id, string(core.EndCallReasonUserEnded))
 	w.WriteHeader(http.StatusNoContent)
