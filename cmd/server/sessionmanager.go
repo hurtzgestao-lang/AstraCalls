@@ -115,29 +115,29 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 		return err
 	}
 	for _, row := range rows {
-		if row.JID == "" {
-			_ = m.db.dropSessionDB(ctx, row.ID)
-			_ = m.store.delete(ctx, row.ID)
-			continue
-		}
-		if _, err := types.ParseJID(row.JID); err != nil {
-			m.log.Warn("dropping session with unparseable jid", "session", row.ID, "jid", row.JID)
-			_ = m.db.dropSessionDB(ctx, row.ID)
-			_ = m.store.delete(ctx, row.ID)
-			continue
+		if row.JID != "" {
+			if _, err := types.ParseJID(row.JID); err != nil {
+				m.log.Warn("dropping session with unparseable jid", "session", row.ID, "jid", row.JID)
+				_ = m.db.dropSessionDB(ctx, row.ID)
+				_ = m.store.delete(ctx, row.ID)
+				continue
+			}
 		}
 		container, db, err := m.db.openSessionContainer(ctx, row.ID)
 		if err != nil {
 			m.log.Error("opening session database failed", "session", row.ID, "err", err)
 			continue
 		}
-		device, err := container.GetFirstDevice(ctx)
-		if err != nil || device == nil || device.ID == nil {
-			m.log.Warn("dropping session with no stored device", "session", row.ID, "jid", row.JID, "err", err)
-			_ = db.Close()
-			_ = m.db.dropSessionDB(ctx, row.ID)
-			_ = m.store.delete(ctx, row.ID)
-			continue
+		device := container.NewDevice()
+		if row.JID != "" {
+			device, err = container.GetFirstDevice(ctx)
+			if err != nil || device == nil || device.ID == nil {
+				m.log.Warn("dropping session with no stored device", "session", row.ID, "jid", row.JID, "err", err)
+				_ = db.Close()
+				_ = m.db.dropSessionDB(ctx, row.ID)
+				_ = m.store.delete(ctx, row.ID)
+				continue
+			}
 		}
 		client := whatsmeow.NewClient(device, m.waLogger)
 		s := newSession(m, row.ID, row.Name, client)
@@ -151,6 +151,12 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 			}
 		}
 		m.register(s)
+		if row.JID == "" {
+			if err := s.startPairing(ctx); err != nil {
+				m.log.Error("restored session pairing failed", "session", row.ID, "err", err)
+			}
+			continue
+		}
 		if err := s.connect(ctx); err != nil {
 			m.log.Error("session connect failed", "session", row.ID, "err", err)
 		}
