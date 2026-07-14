@@ -102,7 +102,8 @@ func withCORS(h http.Handler, rawOrigins string) http.Handler {
 	})
 }
 
-// withAuth protege as rotas /api/* com uma API key (header X-API-Key ou ?apiKey=).
+// withAuth protege as rotas /api/* com uma API key enviada somente por header.
+// Credenciais na query string vazam para historicos, proxies e logs.
 // Os arquivos estáticos do painel permanecem públicos; toda a API é protegida.
 func withAuth(h http.Handler, key string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -110,9 +111,6 @@ func withAuth(h http.Handler, key string) http.Handler {
 		guarded := strings.HasPrefix(p, "/api/")
 		if guarded {
 			got := r.Header.Get("X-API-Key")
-			if got == "" {
-				got = r.URL.Query().Get("apiKey")
-			}
 			if got != key {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 				return
