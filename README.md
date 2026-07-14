@@ -90,8 +90,9 @@ do navegador à porta 50000.
 
 ### 🔐 Autenticação por API key
 Middleware `withAuth`: se `WACALLS_API_KEY` estiver setada, todas as rotas `/api/*` exigem
-o header `X-API-Key` (ou `?apiKey=` no SSE). O cliente React ganhou tela de login (URL +
-key). Essencial para expor o serviço fora de uma LAN confiável.
+o header `X-API-Key`, inclusive o SSE consumido por `fetch`. A chave nunca e aceita em
+query string. O cliente React ganhou tela de login (URL + key). Essencial para expor o
+servico fora de uma LAN confiavel.
 
 ### 🌐 Mídia WebRTC pronta para nuvem (ICE-TCP / NAT 1:1)
 Muitos provedores cloud (ex.: Hetzner) **bloqueiam UDP de entrada novo** na interface
@@ -159,7 +160,6 @@ IP público.
 | `internal/voip/signaling` | Build/parse de stanza `<call>`, cripto da call-key, parse do relay-ack |
 | `internal/voip/call` | `CallManager` — orquestra uma chamada de ponta a ponta |
 | `client/` | React 19 + Vite + Tailwind v4 + shadcn/ui (discador, cards de chamada, sessões, histórico, login) |
-| `client/public/widget.js` | Widget de chamada embutível no Chatwoot |
 
 ---
 
@@ -244,7 +244,7 @@ Notas de produção:
 
 Todas as rotas são escopadas por sessão. Os eventos chegam por um único canal SSE,
 marcados com o `sessionId` de origem. Se `WACALLS_API_KEY` estiver setada, envie
-`X-API-Key` (ou `?apiKey=` no SSE).
+`X-API-Key`; credenciais em query string sao rejeitadas.
 
 ### Sessões e chamadas
 
