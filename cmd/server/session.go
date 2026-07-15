@@ -79,10 +79,10 @@ func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) 
 	return s
 }
 
-func (s *Session) createCall(callID string) *call.CallManager {
+func (s *Session) createCall(callID string, shouldRecord bool) *call.CallManager {
 	cm := call.NewCallManager(wa.NewSocket(s.client), s.log)
 	s.wireCall(cm, callID)
-	s.reg.add(callID, &activeCall{cm: cm})
+	s.reg.add(callID, &activeCall{cm: cm, shouldRecord: shouldRecord})
 	return cm
 }
 
@@ -123,6 +123,9 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			rec.ConnectedAt = &now
 		}
 		s.mgr.broker.upsertCall(rec)
+		if rec.Status == StatusConnected {
+			s.ensureRecorder(callID)
+		}
 		if existing == nil || existing.Status != rec.Status {
 			event := "call.ringing"
 			if rec.Status == StatusConnected {
@@ -138,7 +141,13 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	}
 	cm.OnPeerAudio = func(pcm16 []float32) {
 		ac, ok := s.reg.get(callID)
-		if !ok || ac.bridge == nil || ac.browserOpus == nil {
+		if !ok {
+			return
+		}
+		if ac.recorder != nil {
+			ac.recorder.AddPeerFrame(pcm16)
+		}
+		if ac.bridge == nil || ac.browserOpus == nil {
 			return
 		}
 		pcm48 := media.Upsample16to48(pcm16)
@@ -150,9 +159,9 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	}
 }
 
-func (s *Session) startOutgoing(ctx context.Context, peer types.JID, isVideo bool) (string, error) {
+func (s *Session) startOutgoing(ctx context.Context, peer types.JID, isVideo, shouldRecord bool) (string, error) {
 	callID := signaling.GenerateCallID()
-	cm := s.createCall(callID)
+	cm := s.createCall(callID, shouldRecord)
 	if err := cm.StartCall(ctx, callID, peer, isVideo); err != nil {
 		s.removeCall(callID)
 		return "", err
@@ -178,7 +187,7 @@ func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 		s.rejectOffer(ctx, node, evt.From)
 		return
 	}
-	cm := s.createCall(callID)
+	cm := s.createCall(callID, s.recordingEnabled())
 	cm.HandleCallOffer(ctx, node, evt.From)
 }
 
@@ -312,11 +321,16 @@ func (s *Session) removeCall(callID string) {
 	if !ok {
 		return
 	}
+	record, hasRecord := s.mgr.broker.getCall(callID)
+	recorder := ac.recorder
 	if ac.bridge != nil {
 		ac.bridge.Close()
 	}
 	if ac.browserOpus != nil {
 		ac.browserOpus.Close()
+	}
+	if recorder != nil && hasRecord {
+		go s.finalizeRecording(*record, recorder)
 	}
 }
 
@@ -338,6 +352,37 @@ func (s *Session) teardownAllCalls() {
 			ac.browserOpus.Close()
 		}
 	}
+}
+
+func (s *Session) ensureRecorder(callID string) {
+	ac, ok := s.reg.get(callID)
+	if !ok || !ac.shouldRecord || ac.recorder != nil {
+		return
+	}
+	recorder, err := newCallRecorder(callID, s.log)
+	if err != nil {
+		s.log.Warn("recording init failed", "call_id", callID, "err", err)
+		if record, found := s.mgr.broker.getCall(callID); found {
+			s.dispatchRecordingFailed(*record, err)
+		}
+		ac.shouldRecord = false
+		return
+	}
+	ac.recorder = recorder
+}
+
+func (s *Session) finalizeRecording(record CallRecord, recorder *CallRecorder) {
+	info, filePath, err := recorder.Finalize()
+	if err != nil {
+		s.log.Warn("recording finalize failed", "call_id", record.CallID, "err", err)
+		recorder.cleanupTemps()
+		s.dispatchRecordingFailed(record, err)
+		return
+	}
+	if info == nil || filePath == "" {
+		return
+	}
+	s.dispatchRecordingReady(record, info, filePath)
 }
 
 func (s *Session) replaceClient(client *whatsmeow.Client) {

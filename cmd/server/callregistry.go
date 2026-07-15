@@ -8,9 +8,11 @@ import (
 )
 
 type activeCall struct {
-	cm          *call.CallManager
-	bridge      *Bridge
-	browserOpus media.Codec
+	cm           *call.CallManager
+	bridge       *Bridge
+	browserOpus  media.Codec
+	shouldRecord bool
+	recorder     *CallRecorder
 }
 
 type callRegistry struct {

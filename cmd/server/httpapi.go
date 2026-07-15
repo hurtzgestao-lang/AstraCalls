@@ -279,7 +279,8 @@ func (s *server) doStartCall(sess *Session, w http.ResponseWriter, r *http.Reque
 	}
 	peer := types.NewJID(normalizePhone(body.Phone), types.DefaultUserServer)
 
-	callID, err := sess.startOutgoing(r.Context(), peer, false)
+	shouldRecord := body.Record || sess.recordingEnabled()
+	callID, err := sess.startOutgoing(r.Context(), peer, false, shouldRecord)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -327,7 +328,11 @@ func (s *server) doWebRTC(sess *Session, w http.ResponseWriter, r *http.Request)
 		if err != nil {
 			return
 		}
-		ac.cm.FeedCapturedPCM(media.Downsample48to16(pcm48))
+		pcm16 := media.Downsample48to16(pcm48)
+		if ac.recorder != nil {
+			ac.recorder.AddAgentFrame(pcm16)
+		}
+		ac.cm.FeedCapturedPCM(pcm16)
 	}
 	bridge.OnTerminalICE = func() {
 		go sess.terminateCall(callID, core.EndCallReasonUserEnded)

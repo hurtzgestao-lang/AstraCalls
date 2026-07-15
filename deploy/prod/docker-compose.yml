@@ -43,9 +43,12 @@ services:
       WACALLS_MAX_CALLS: "8"
       WACALLS_ENABLE_MESSAGES: "false"
       WACALLS_ENABLE_CHATWOOT_MESSAGES: "false"
+      WACALLS_RECORDINGS_DIR: /var/lib/astracalls/recordings
     depends_on:
       postgres:
         condition: service_healthy
+    volumes:
+      - astracalls_recordings_tmp:/var/lib/astracalls/recordings
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/readyz"]
       interval: 15s
@@ -90,6 +93,7 @@ services:
 
 volumes:
   astracalls_postgres:
+  astracalls_recordings_tmp:
 
 networks:
   hurtz_proxy:
