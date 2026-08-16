@@ -17,6 +17,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    networks:
+      - internal
     logging:
       driver: local
       options:
@@ -24,23 +26,22 @@ services:
         max-file: "3"
 
   astracalls:
-    image: hurtz-astracalls:${ASTRACALLS_GIT_SHA:?ASTRACALLS_GIT_SHA is required}
-    build:
-      context: ../..
-      dockerfile: Dockerfile
-      labels:
-        org.opencontainers.image.revision: ${ASTRACALLS_GIT_SHA}
-        org.opencontainers.image.source: https://github.com/hurtzgestao-lang/AstraCalls
+    image: ${ASTRACALLS_IMAGE:?ASTRACALLS_IMAGE must be an immutable registry digest}
+    pull_policy: ${ASTRACALLS_PULL_POLICY:-never}
     restart: unless-stopped
-    network_mode: host
+    ports:
+      - "50000:50000/tcp"
+      - "50000:50000/udp"
     environment:
-      WACALLS_PG_URL: postgres://astracalls:${POSTGRES_PASSWORD}@127.0.0.1:55433/postgres?sslmode=disable
+      WACALLS_PG_URL: postgres://astracalls:${POSTGRES_PASSWORD}@postgres:5432/postgres?sslmode=disable
       WACALLS_PG_NAMESPACE: hurtz_calls
       WACALLS_API_KEY: ${WACALLS_API_KEY:?WACALLS_API_KEY is required}
+      ASTRACALLS_ENABLED: ${ASTRACALLS_ENABLED:-true}
       WACALLS_ALLOWED_ORIGINS: https://calls.hurtzcompany.com.br,https://crm.hurtzcompany.com.br
       WACALLS_PUBLIC_IP: 173.249.22.212
       WACALLS_UDP_PORT: "50000"
       WACALLS_MAX_CALLS: "8"
+      WACALLS_GLOBAL_MAX_CALLS: "32"
       WACALLS_ENABLE_MESSAGES: "false"
       WACALLS_ENABLE_CHATWOOT_MESSAGES: "false"
       WACALLS_RECORDINGS_DIR: /var/lib/astracalls/recordings
@@ -49,6 +50,9 @@ services:
         condition: service_healthy
     volumes:
       - astracalls_recordings_tmp:/var/lib/astracalls/recordings
+    networks:
+      - internal
+      - hurtz_proxy
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/readyz"]
       interval: 15s
@@ -65,8 +69,6 @@ services:
     restart: unless-stopped
     volumes:
       - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-    extra_hosts:
-      - host.docker.internal:host-gateway
     networks:
       - hurtz_proxy
     depends_on:
@@ -79,6 +81,8 @@ services:
       traefik.http.routers.astracalls.entrypoints: websecure
       traefik.http.routers.astracalls.tls: "true"
       traefik.http.routers.astracalls.tls.certresolver: letsencrypt
+      traefik.http.routers.astracalls.middlewares: astracalls-auth
+      traefik.http.middlewares.astracalls-auth.basicauth.users: ${ASTRACALLS_PORTAL_BASIC_AUTH:?ASTRACALLS_PORTAL_BASIC_AUTH is required}
       traefik.http.services.astracalls.loadbalancer.server.port: "80"
     healthcheck:
       test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/healthz"]
@@ -96,6 +100,7 @@ volumes:
   astracalls_recordings_tmp:
 
 networks:
+  internal:
   hurtz_proxy:
     external: true
     name: hurtz_crm_prod_proxy
