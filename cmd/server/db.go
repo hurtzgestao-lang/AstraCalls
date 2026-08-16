@@ -72,7 +72,7 @@ func newDBProvider(ctx context.Context, rawURL, ns string, waLogger waLog.Logger
 	return p, nil
 }
 
-func (p *dbProvider) mainDBName() string        { return p.ns + "_main" }
+func (p *dbProvider) mainDBName() string             { return p.ns + "_main" }
 func (p *dbProvider) sessionDBName(id string) string { return p.ns + "_" + id }
 
 // dsnFor devolve a URL de conexão para um banco específico (troca o path).

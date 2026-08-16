@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log/slog"
-	"os"
 	"sync"
 	"time"
 
@@ -16,7 +15,6 @@ import (
 
 	"database/sql"
 
-	"github.com/mdp/qrterminal/v3"
 	"go.mau.fi/whatsmeow"
 	waBinary "go.mau.fi/whatsmeow/binary"
 	"go.mau.fi/whatsmeow/store/sqlstore"
@@ -37,19 +35,23 @@ type Session struct {
 	waContainer *sqlstore.Container
 	waDB        *sql.DB
 
-	mu       sync.Mutex
-	auth     AuthSnapshot
-	webhook  string
-	chatwoot ChatwootConfig
+	mu               sync.Mutex
+	auth             AuthSnapshot
+	webhook          WebhookConfig
+	chatwoot         ChatwootConfig
+	tenantKey        string
+	accountID        int
+	inboxID          int
+	pairingExpiresAt *time.Time
 }
 
-func (s *Session) setWebhook(url string) {
+func (s *Session) setWebhook(config WebhookConfig) {
 	s.mu.Lock()
-	s.webhook = url
+	s.webhook = config
 	s.mu.Unlock()
 }
 
-func (s *Session) getWebhook() string {
+func (s *Session) getWebhook() WebhookConfig {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.webhook
@@ -81,23 +83,26 @@ func newSession(mgr *SessionManager, id, name string, client *whatsmeow.Client) 
 	return s
 }
 
-func (s *Session) createCall(callID string) *call.CallManager {
+func (s *Session) createCall(callID string, shouldRecord bool) *call.CallManager {
 	cm := call.NewCallManager(wa.NewSocket(s.client), s.log)
 	s.wireCall(cm, callID)
-	s.reg.add(callID, &activeCall{cm: cm})
+	s.reg.add(callID, &activeCall{cm: cm, shouldRecord: shouldRecord})
 	return cm
 }
 
 func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	cm.OnIncoming = func(c *call.CallInfo) {
-		s.mgr.broker.upsertCall(CallRecord{
+		record := CallRecord{
 			SessionID: s.id, CallID: c.CallID, Direction: "inbound", Peer: c.PeerJid,
-			StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
-		})
+			Phone: digitsOnly(c.CallerPn), StartedAt: time.Now().UnixMilli(), Status: StatusRinging,
+		}
+		s.mgr.broker.upsertCall(record)
 		s.mgr.broker.emitIncoming(s.id, c.CallID, c.PeerJid)
+		s.dispatchCallWebhook("call.incoming", record)
 	}
 	cm.OnStateChange = func(c *call.CallInfo) {
 		if c.IsEnded() {
+			s.dispatchCallEnded(c.CallID, string(c.StateData.EndReason))
 			s.removeCall(c.CallID)
 			s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
 			return
@@ -114,16 +119,41 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 		if existing != nil {
 			rec.Owner = existing.Owner
 			rec.StartedAt = existing.StartedAt
+			rec.ConnectedAt = existing.ConnectedAt
+			rec.Phone = existing.Phone
+			rec.Metadata = existing.Metadata
+			rec.IdempotencyKey = existing.IdempotencyKey
+		}
+		if rec.Status == StatusConnected && rec.ConnectedAt == nil {
+			now := time.Now().UnixMilli()
+			rec.ConnectedAt = &now
 		}
 		s.mgr.broker.upsertCall(rec)
+		if rec.Status == StatusConnected {
+			s.ensureRecorder(callID)
+		}
+		if existing == nil || existing.Status != rec.Status {
+			event := "call.ringing"
+			if rec.Status == StatusConnected {
+				event = "call.connected"
+			}
+			s.dispatchCallWebhook(event, rec)
+		}
 	}
 	cm.OnEnded = func(c *call.CallInfo) {
+		s.dispatchCallEnded(c.CallID, string(c.StateData.EndReason))
 		s.removeCall(c.CallID)
 		s.mgr.broker.endCall(c.CallID, string(c.StateData.EndReason))
 	}
 	cm.OnPeerAudio = func(pcm16 []float32) {
 		ac, ok := s.reg.get(callID)
-		if !ok || ac.bridge == nil || ac.browserOpus == nil {
+		if !ok {
+			return
+		}
+		if ac.recorder != nil {
+			ac.recorder.AddPeerFrame(pcm16)
+		}
+		if ac.bridge == nil || ac.browserOpus == nil {
 			return
 		}
 		pcm48 := media.Upsample16to48(pcm16)
@@ -135,14 +165,40 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	}
 }
 
-func (s *Session) startOutgoing(ctx context.Context, peer types.JID, isVideo bool) (string, error) {
-	callID := signaling.GenerateCallID()
-	cm := s.createCall(callID)
+func (s *Session) startOutgoing(ctx context.Context, callID string, peer types.JID, isVideo, shouldRecord bool) error {
+	cm := s.createCall(callID, shouldRecord)
 	if err := cm.StartCall(ctx, callID, peer, isVideo); err != nil {
 		s.removeCall(callID)
-		return "", err
+		return err
 	}
-	return callID, nil
+	return nil
+}
+
+func (s *Session) waitOutgoingOffer(callID string, timeout time.Duration) CallStatus {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if ac, ok := s.reg.get(callID); ok {
+			if current := ac.cm.CurrentCall(); current != nil {
+				status := mapStatus(current.StateData.State)
+				if status != StatusStarting {
+					return status
+				}
+			}
+		} else {
+			return StatusEnded
+		}
+
+		select {
+		case <-deadline.C:
+			return StatusStarting
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Session) callForEvent(from types.JID, data *waBinary.Node) (*activeCall, bool) {
@@ -163,7 +219,7 @@ func (s *Session) onIncomingOffer(ctx context.Context, evt *events.CallOffer) {
 		s.rejectOffer(ctx, node, evt.From)
 		return
 	}
-	cm := s.createCall(callID)
+	cm := s.createCall(callID, s.recordingEnabled())
 	cm.HandleCallOffer(ctx, node, evt.From)
 }
 
@@ -186,8 +242,13 @@ func (s *Session) handleEvent(rawEvt any) {
 	switch evt := rawEvt.(type) {
 	case *events.Connected:
 		if id := s.client.Store.ID; id != nil {
+			if !s.mgr.jidAvailable(s.id, id.String()) {
+				s.rejectDuplicatePairing(ctx)
+				return
+			}
 			_ = s.mgr.store.setJID(s.mgr.appCtx, s.id, id.String())
 		}
+		s.clearPairingExpiry()
 		s.setAuth(AuthSnapshot{State: "open", Paired: true})
 	case *events.LoggedOut:
 		s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
@@ -241,13 +302,17 @@ func (s *Session) startPairing(ctx context.Context) error {
 			switch evt.Event {
 			case "code":
 				s.log.Info("scan the QR code to pair this session")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 				s.setAuth(AuthSnapshot{State: "qr", QR: evt.Code})
 				s.mgr.broker.emitSessionQR(s.id, evt.Code)
 			case "success":
 				if id := s.client.Store.ID; id != nil {
+					if !s.mgr.jidAvailable(s.id, id.String()) {
+						s.rejectDuplicatePairing(context.Background())
+						continue
+					}
 					_ = s.mgr.store.setJID(s.mgr.appCtx, s.id, id.String())
 				}
+				s.clearPairingExpiry()
 				s.setAuth(AuthSnapshot{State: "open", Paired: true})
 			case "timeout":
 				s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
@@ -268,12 +333,39 @@ func (s *Session) setAuth(a AuthSnapshot) {
 func (s *Session) info() SessionInfo {
 	s.mu.Lock()
 	a := s.auth
+	tenantKey := s.tenantKey
+	accountID := s.accountID
+	inboxID := s.inboxID
+	pairingExpiresAt := s.pairingExpiresAt
 	s.mu.Unlock()
 	jid := ""
 	if id := s.client.Store.ID; id != nil {
-		jid = id.String()
+		jid = sessionInfoJID(*id)
 	}
-	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != ""}
+	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != "", QR: a.QR,
+		TenantKey: tenantKey, AccountID: accountID, InboxID: inboxID, PairingExpiresAt: pairingExpiresAt}
+}
+
+func (s *Session) clearPairingExpiry() {
+	s.mu.Lock()
+	s.pairingExpiresAt = nil
+	s.mu.Unlock()
+}
+
+func (s *Session) rejectDuplicatePairing(ctx context.Context) {
+	s.log.Warn("duplicate WhatsApp identity rejected")
+	if s.client.Store.ID != nil {
+		_ = s.client.Logout(ctx)
+	}
+	_ = s.mgr.store.setJID(s.mgr.appCtx, s.id, "")
+	s.setAuth(AuthSnapshot{State: "duplicate_phone", Paired: false})
+}
+
+func sessionInfoJID(jid types.JID) string {
+	if jid.User == "" || jid.Server == "" {
+		return jid.String()
+	}
+	return jid.User + "@" + jid.Server
 }
 
 func (s *Session) setBridge(callID string, b *Bridge, oc media.Codec) {
@@ -298,11 +390,16 @@ func (s *Session) removeCall(callID string) {
 	if !ok {
 		return
 	}
+	record, hasRecord := s.mgr.broker.getCall(callID)
+	recorder := ac.recorder
 	if ac.bridge != nil {
 		ac.bridge.Close()
 	}
 	if ac.browserOpus != nil {
 		ac.browserOpus.Close()
+	}
+	if recorder != nil && hasRecord {
+		go s.finalizeRecording(*record, recorder)
 	}
 }
 
@@ -324,6 +421,37 @@ func (s *Session) teardownAllCalls() {
 			ac.browserOpus.Close()
 		}
 	}
+}
+
+func (s *Session) ensureRecorder(callID string) {
+	ac, ok := s.reg.get(callID)
+	if !ok || !ac.shouldRecord || ac.recorder != nil {
+		return
+	}
+	recorder, err := newCallRecorder(callID, s.log)
+	if err != nil {
+		s.log.Warn("recording init failed", "call_id", callID, "err", err)
+		if record, found := s.mgr.broker.getCall(callID); found {
+			s.dispatchRecordingFailed(*record, err)
+		}
+		ac.shouldRecord = false
+		return
+	}
+	ac.recorder = recorder
+}
+
+func (s *Session) finalizeRecording(record CallRecord, recorder *CallRecorder) {
+	info, filePath, err := recorder.Finalize()
+	if err != nil {
+		s.log.Warn("recording finalize failed", "call_id", record.CallID, "err", err)
+		recorder.cleanupTemps()
+		s.dispatchRecordingFailed(record, err)
+		return
+	}
+	if info == nil || filePath == "" {
+		return
+	}
+	s.dispatchRecordingReady(record, info, filePath)
 }
 
 func (s *Session) replaceClient(client *whatsmeow.Client) {

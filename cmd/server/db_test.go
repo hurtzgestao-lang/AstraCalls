@@ -1,27 +1,39 @@
 package main
 
 import (
-	"path/filepath"
-	"strings"
+	"net/url"
 	"testing"
 )
 
-func TestOpenDBConcurrencyConfig(t *testing.T) {
-	db, err := openDB(filepath.Join(t.TempDir(), "concurrency.db"))
+func TestPostgresDatabaseNamesAndDSN(t *testing.T) {
+	provider := &dbProvider{
+		ns:   "hurtz_calls",
+		base: mustParseURL(t, "postgres://astracalls:secret@127.0.0.1:55433/postgres?sslmode=disable"),
+	}
+
+	if got := provider.mainDBName(); got != "hurtz_calls_main" {
+		t.Fatalf("unexpected main database name: %q", got)
+	}
+	if got := provider.sessionDBName("abc123"); got != "hurtz_calls_abc123" {
+		t.Fatalf("unexpected session database name: %q", got)
+	}
+	want := "postgres://astracalls:secret@127.0.0.1:55433/hurtz_calls_abc123?sslmode=disable"
+	if got := provider.dsnFor(provider.sessionDBName("abc123")); got != want {
+		t.Fatalf("unexpected session DSN: %q", got)
+	}
+}
+
+func mustParseURL(t *testing.T, value string) *url.URL {
+	t.Helper()
+	parsed, err := url.Parse(value)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	return parsed
+}
 
-	if got := db.Stats().MaxOpenConnections; got != 1 {
-		t.Fatalf("expected pool capped to 1 connection, got %d", got)
-	}
-
-	var mode string
-	if err := db.QueryRow("PRAGMA journal_mode").Scan(&mode); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.EqualFold(mode, "wal") {
-		t.Fatalf("expected WAL journal mode, got %q", mode)
+func TestQuoteIdentEscapesDoubleQuotes(t *testing.T) {
+	if got := quoteIdent(`hurtz"calls`); got != `"hurtz""calls"` {
+		t.Fatalf("unexpected quoted identifier: %q", got)
 	}
 }

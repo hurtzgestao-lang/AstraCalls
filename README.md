@@ -82,16 +82,17 @@ find/create por telefone, mensagens **WhatsApp → Chatwoot** (texto + mídia) e
 **Chatwoot → WhatsApp** via webhook (`message_created/outgoing`). Tudo com **1 QR só** por
 número — a mesma sessão serve chamadas, mensagens e Chatwoot.
 
-### 📲 Widget de chamada dentro do Chatwoot
-`widget.js` é injetado no Chatwoot via `<script src=".../widget.js" data-api-key="...">` e
-adiciona um **botão de telefone na conversa**. Faz a chamada WebRTC direto do navegador do
-agente, **abre e toca automaticamente quando chega uma ligação**, mostra "Chamando…" até o
-outro lado atender, inicia o cronômetro só na conexão real e silencia o toque ao atender.
+### 📲 Ponte nativa Hurtz CRM
+O piloto Hurtz não injeta `widget.js` nem entrega a chave administrativa aos agentes. O
+CRM autentica o operador, faz as chamadas HTTP server-side e reutiliza sua mensagem
+`voice_call`, eventos em tempo real e widget flutuante. Somente a mídia WebRTC vai direto
+do navegador à porta 50000.
 
 ### 🔐 Autenticação por API key
 Middleware `withAuth`: se `WACALLS_API_KEY` estiver setada, todas as rotas `/api/*` exigem
-o header `X-API-Key` (ou `?apiKey=` no SSE). O cliente React ganhou tela de login (URL +
-key). Essencial para expor o serviço fora de uma LAN confiável.
+o header `X-API-Key`, inclusive o SSE consumido por `fetch`. A chave nunca e aceita em
+query string. O cliente React ganhou tela de login (URL + key). Essencial para expor o
+servico fora de uma LAN confiavel.
 
 ### 🌐 Mídia WebRTC pronta para nuvem (ICE-TCP / NAT 1:1)
 Muitos provedores cloud (ex.: Hetzner) **bloqueiam UDP de entrada novo** na interface
@@ -159,7 +160,6 @@ IP público.
 | `internal/voip/signaling` | Build/parse de stanza `<call>`, cripto da call-key, parse do relay-ack |
 | `internal/voip/call` | `CallManager` — orquestra uma chamada de ponta a ponta |
 | `client/` | React 19 + Vite + Tailwind v4 + shadcn/ui (discador, cards de chamada, sessões, histórico, login) |
-| `client/public/widget.js` | Widget de chamada embutível no Chatwoot |
 
 ---
 
@@ -215,27 +215,24 @@ npm run dev      # Vite na :5173, faz proxy de /api → http://localhost:8080
 | `WACALLS_PUBLIC_IP` | — | IP público p/ NAT 1:1 / ICE-TCP (`auto` detecta) |
 | `WACALLS_UDP_PORT` | — | Porta de mídia (UDP + ICE-TCP) |
 | `WACALLS_MAX_CALLS` | `8` | Equivalente a `-max-calls-per-session` por env |
+| `WACALLS_ALLOWED_ORIGINS` | — | Lista CORS separada por vírgulas |
+| `WACALLS_ENABLE_MESSAGES` | `true` | Expõe endpoints de mensagens; `false` no piloto Hurtz |
+| `WACALLS_ENABLE_CHATWOOT_MESSAGES` | `true` | Expõe a ponte legada de mensagens; `false` no piloto Hurtz |
 
 ---
 
-## 🐳 Deploy em produção (Docker Swarm + Traefik)
+## 🐳 Deploy em produção (Docker Compose + Traefik)
 
 ```bash
-# imagem oficial publicada no Docker Hub:
-#   astraonline/wacalls:develop
-# para usar direto, basta referenciá-la na stack (PullImage).
-
-# para buildar a sua própria a partir do código:
-docker build -t astraonline/wacalls:develop .
-docker push astraonline/wacalls:develop
-
-# deploy da stack (Postgres + servidor em rede de host + proxy Traefik)
-docker stack deploy -c astracalls-stack.yml astracalls
+# Configure segredos fortes e o SHA exato do código.
+cp deploy/prod/.env.example deploy/prod/.env
+docker compose --env-file deploy/prod/.env -f deploy/prod/docker-compose.yml build
+docker compose --env-file deploy/prod/.env -f deploy/prod/docker-compose.yml up -d
 ```
 
 Notas de produção:
 - O servidor roda em **rede de host** para a mídia WebRTC enxergar a interface real.
-- Um serviço **socat** com labels do Traefik publica o HTTP em **HTTPS** (necessário porque
+- Um proxy **nginx** com labels do Traefik publica o HTTP em **HTTPS** (necessário porque
   `getUserMedia` só funciona em contexto seguro).
 - O **PostgreSQL** dedicado escuta apenas em `127.0.0.1` (não exposto à internet).
 - Defina `WACALLS_PUBLIC_IP=auto`, `WACALLS_UDP_PORT`, `WACALLS_PG_URL` e uma
@@ -247,7 +244,7 @@ Notas de produção:
 
 Todas as rotas são escopadas por sessão. Os eventos chegam por um único canal SSE,
 marcados com o `sessionId` de origem. Se `WACALLS_API_KEY` estiver setada, envie
-`X-API-Key` (ou `?apiKey=` no SSE).
+`X-API-Key`; credenciais em query string sao rejeitadas.
 
 ### Sessões e chamadas
 
@@ -272,17 +269,24 @@ marcados com o `sessionId` de origem. Se `WACALLS_API_KEY` estiver setada, envie
 |---|---|---|
 | `POST` | `/api/sessions/{sid}/messages/text` | Envia texto |
 | `POST` | `/api/sessions/{sid}/messages/{image\|audio\|video\|document}` | Envia mídia (base64 ou URL) |
-| `GET/POST/DELETE` | `/api/sessions/{sid}/webhook` | Configura webhook de eventos da sessão |
+| `GET/POST/DELETE` | `/api/sessions/{sid}/webhook` | Configura `{url, secret, events}` por sessão |
 | `GET/POST/DELETE` | `/api/sessions/{sid}/chatwoot` | Configura a integração Chatwoot |
 | `POST` | `/api/sessions/{sid}/chatwoot/webhook` | Recebe eventos do Chatwoot (outgoing → WhatsApp) |
 | `GET` | `/api/chatwoot/resolve` | Resolve sessão/contato para o widget (`?account_id=&conversation_id=`) |
+
+Callbacks de chamada usam `{session, event, timestamp, data}` e os eventos
+`call.incoming`, `call.ringing`, `call.connected`, `call.claimed` e `call.ended`. Quando
+há `secret`, o corpo é assinado com HMAC-SHA256 nos headers
+`X-AstraCalls-Timestamp` e `X-AstraCalls-Signature`. Entregas com falha têm no máximo
+três tentativas; o consumidor deve manter idempotência por sessão e call ID.
 
 ---
 
 ## 🧪 Testes
 
 ```bash
-go test ./...                 # pilha de mídia: SRTP, STUN, RTP, relay-ack, codec, estado
+go vet ./...
+CGO_ENABLED=1 go test -race ./...
 cd client && npm run build    # type-check + build de produção do cliente
 ```
 

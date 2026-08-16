@@ -29,6 +29,7 @@ coverage.*
 *.keys
 nc-qr.txt
 .DS_Store
+.env
 Thumbs.db
 .idea/
 .vscode/

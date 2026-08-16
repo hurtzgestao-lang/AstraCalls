@@ -2,21 +2,27 @@ package main
 
 import (
 	"context"
-	"database/sql"
-	"path/filepath"
 	"testing"
+
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 func TestSessionStoreRoundtrip(t *testing.T) {
 	ctx := context.Background()
-	dbPath := filepath.Join(t.TempDir(), "sessions_test.db")
-	db, err := sql.Open("sqlite", "file:"+dbPath)
+	db, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
-	st, err := newSessionStore(ctx, db)
+	mock.ExpectExec("CREATE TABLE IF NOT EXISTS sessions").WillReturnResult(sqlmock.NewResult(0, 0))
+	for range 8 {
+		mock.ExpectExec("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	}
+	for range 2 {
+		mock.ExpectExec("CREATE UNIQUE INDEX IF NOT EXISTS").WillReturnResult(sqlmock.NewResult(0, 0))
+	}
+	store, err := newSessionStore(ctx, db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,31 +31,44 @@ func TestSessionStoreRoundtrip(t *testing.T) {
 	if len(id) != 32 {
 		t.Fatalf("session id should be 32 hex chars, got %d", len(id))
 	}
-	if err := st.insert(ctx, id, "Account A"); err != nil {
+	params := SessionCreateParams{Name: "Account A"}
+	mock.ExpectExec("INSERT INTO sessions").
+		WithArgs(id, "Account A", nil, nil, nil, nil, nil).
+		WillReturnResult(sqlmock.NewResult(1, 1))
+	if err := store.insert(ctx, id, params); err != nil {
 		t.Fatal(err)
 	}
 
-	rows, err := st.list(ctx)
+	rows := sqlmock.NewRows([]string{"id", "name", "jid", "webhook", "chatwoot", "tenant_key", "account_id", "inbox_id", "idempotency_key", "pairing_expires_at"}).
+		AddRow(id, "Account A", "", "", "", "", 0, 0, "", nil)
+	mock.ExpectQuery("SELECT id, name").WillReturnRows(rows)
+	listed, err := store.list(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].ID != id || rows[0].Name != "Account A" || rows[0].JID != "" {
-		t.Fatalf("unexpected rows after insert: %+v", rows)
+	if len(listed) != 1 || listed[0].ID != id || listed[0].Name != "Account A" || listed[0].JID != "" {
+		t.Fatalf("unexpected rows after insert: %+v", listed)
 	}
 
-	if err := st.setJID(ctx, id, "5511999999999:1@s.whatsapp.net"); err != nil {
+	mock.ExpectExec("UPDATE sessions SET jid").WithArgs("5511999999999:1@s.whatsapp.net", id).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := store.setJID(ctx, id, "5511999999999:1@s.whatsapp.net"); err != nil {
 		t.Fatal(err)
-	}
-	rows, _ = st.list(ctx)
-	if rows[0].JID != "5511999999999:1@s.whatsapp.net" {
-		t.Fatalf("jid not persisted: %+v", rows[0])
 	}
 
-	if err := st.delete(ctx, id); err != nil {
+	mock.ExpectExec("UPDATE sessions").
+		WithArgs(id, "account:115:inbox:153", 115, 153).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	claimed, err := store.claimTenant(ctx, id, "account:115:inbox:153", 115, 153)
+	if err != nil || !claimed {
+		t.Fatalf("legacy session tenant claim failed: claimed=%v err=%v", claimed, err)
+	}
+
+	mock.ExpectExec("DELETE FROM sessions").WithArgs(id).WillReturnResult(sqlmock.NewResult(0, 1))
+	if err := store.delete(ctx, id); err != nil {
 		t.Fatal(err)
 	}
-	rows, _ = st.list(ctx)
-	if len(rows) != 0 {
-		t.Fatalf("expected empty after delete, got %+v", rows)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
 	}
 }

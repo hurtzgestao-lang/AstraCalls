@@ -8,15 +8,17 @@ import (
 )
 
 type server struct {
-	broker    *Broker
-	sessions  *SessionManager
-	log       *slog.Logger
-	staticDir string
+	broker         *Broker
+	sessions       *SessionManager
+	runtime        *runtimeStore
+	log            *slog.Logger
+	staticDir      string
+	maxGlobalCalls int
 }
 
 // newServer monta o provedor de banco (Postgres, 1 banco por sessão no estilo
 // WAHA), abre o banco principal e inicializa o gerenciador de sessões.
-func newServer(ctx context.Context, pgURL, pgNamespace, staticDir string, maxCalls int, log *slog.Logger) (*server, error) {
+func newServer(ctx context.Context, pgURL, pgNamespace, staticDir string, maxCalls, maxGlobalCalls int, log *slog.Logger) (*server, error) {
 	waLogger := waLog.Noop
 	if log.Enabled(ctx, slog.LevelDebug) {
 		waLogger = waLog.Stdout("WA", "DEBUG", true)
@@ -35,10 +37,21 @@ func newServer(ctx context.Context, pgURL, pgNamespace, staticDir string, maxCal
 	if err != nil {
 		return nil, err
 	}
+	runtime, err := newRuntimeStore(ctx, mainDB, log)
+	if err != nil {
+		return nil, err
+	}
+	if err := runtime.reconcileInterruptedCalls(ctx); err != nil {
+		return nil, err
+	}
 
 	broker := NewBroker()
+	broker.setRuntimeStore(runtime)
 	mgr := newSessionManager(ctx, provider, broker, store, waLogger, log, maxCalls)
 	broker.SnapshotFn = mgr.snapshotEvents
 
-	return &server{broker: broker, sessions: mgr, log: log, staticDir: staticDir}, nil
+	return &server{
+		broker: broker, sessions: mgr, runtime: runtime, log: log,
+		staticDir: staticDir, maxGlobalCalls: maxGlobalCalls,
+	}, nil
 }
