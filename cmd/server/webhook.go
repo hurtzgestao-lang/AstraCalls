@@ -27,16 +27,17 @@ type WebhookConfig struct {
 }
 
 type CallWebhookData struct {
-	CallID      string  `json:"call_id"`
-	Direction   string  `json:"direction"`
-	Phone       string  `json:"phone"`
-	Peer        string  `json:"peer"`
-	Status      string  `json:"status"`
-	Owner       *string `json:"owner,omitempty"`
-	StartedAt   int64   `json:"started_at"`
-	ConnectedAt *int64  `json:"connected_at,omitempty"`
-	EndedAt     *int64  `json:"ended_at,omitempty"`
-	EndReason   string  `json:"end_reason,omitempty"`
+	CallID      string         `json:"call_id"`
+	Direction   string         `json:"direction"`
+	Phone       string         `json:"phone"`
+	Peer        string         `json:"peer"`
+	Status      string         `json:"status"`
+	Owner       *string        `json:"owner,omitempty"`
+	StartedAt   int64          `json:"started_at"`
+	ConnectedAt *int64         `json:"connected_at,omitempty"`
+	EndedAt     *int64         `json:"ended_at,omitempty"`
+	EndReason   string         `json:"end_reason,omitempty"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
 }
 
 func parseStoredWebhook(raw string) WebhookConfig {
@@ -80,7 +81,9 @@ func (s *Session) dispatchWebhook(event string, data any) {
 		return
 	}
 	timestamp := time.Now().UnixMilli()
+	eventID := newEventID()
 	body, err := json.Marshal(map[string]any{
+		"event_id":  eventID,
 		"session":   s.id,
 		"event":     event,
 		"timestamp": timestamp,
@@ -88,6 +91,14 @@ func (s *Session) dispatchWebhook(event string, data any) {
 	})
 	if err != nil {
 		return
+	}
+	if s.mgr != nil && s.mgr.broker != nil {
+		if store := s.mgr.broker.runtimeStore(); store != nil {
+			if _, err := store.enqueueWebhook(context.Background(), eventID, s.id, event, timestamp, body, config, "", nil); err != nil {
+				s.log.Error("queueing webhook failed", "event", event, "event_id", eventID, "err", err)
+			}
+			return
+		}
 	}
 	go func() {
 		for attempt := 1; attempt <= 3; attempt++ {
@@ -138,7 +149,7 @@ func (s *Session) dispatchCallWebhook(event string, record CallRecord) {
 	s.dispatchWebhook(event, CallWebhookData{
 		CallID: record.CallID, Direction: record.Direction, Phone: phone, Peer: record.Peer,
 		Status: string(record.Status), Owner: record.Owner, StartedAt: record.StartedAt,
-		ConnectedAt: record.ConnectedAt, EndedAt: record.EndedAt, EndReason: record.EndReason,
+		ConnectedAt: record.ConnectedAt, EndedAt: record.EndedAt, EndReason: record.EndReason, Metadata: record.Metadata,
 	})
 }
 

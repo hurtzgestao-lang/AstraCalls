@@ -27,3 +27,14 @@ func TestWithAuthRejectsAPIKeyInQueryString(t *testing.T) {
 		t.Fatalf("header credential returned %d, want %d", headerResponse.Code, http.StatusNoContent)
 	}
 }
+
+func TestCallsCanBeDisabledWithoutDisablingHealth(t *testing.T) {
+	t.Setenv("ASTRACALLS_ENABLED", "false")
+	response := httptest.NewRecorder()
+	if requireCallsEnabled(response) {
+		t.Fatal("calls should be disabled")
+	}
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusServiceUnavailable)
+	}
+}

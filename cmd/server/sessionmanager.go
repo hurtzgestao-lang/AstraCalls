@@ -3,13 +3,20 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 	waLog "go.mau.fi/whatsmeow/util/log"
+)
+
+var (
+	errSessionNotFound       = errors.New("session not found")
+	errSessionTenantConflict = errors.New("session belongs to another tenant")
 )
 
 type SessionManager struct {
@@ -22,6 +29,7 @@ type SessionManager struct {
 	maxCalls int
 
 	mu       sync.RWMutex
+	createMu sync.Mutex
 	sessions map[string]*Session
 	order    []string
 }
@@ -82,11 +90,59 @@ func (m *SessionManager) sessionForChatwootInbox(accountID, inboxID int) *Sessio
 	return nil
 }
 
+func (m *SessionManager) jidAvailable(sessionID, jid string) bool {
+	if jid == "" {
+		return false
+	}
+	candidate, err := types.ParseJID(jid)
+	if err != nil {
+		return false
+	}
+	canonicalJID := sessionInfoJID(candidate)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for id, session := range m.sessions {
+		if id == sessionID || session.client.Store.ID == nil {
+			continue
+		}
+		if sessionInfoJID(*session.client.Store.ID) == canonicalJID {
+			return false
+		}
+	}
+	return true
+}
+
 func (m *SessionManager) Get(id string) (*Session, bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	s, ok := m.sessions[id]
 	return s, ok
+}
+
+func (m *SessionManager) ClaimTenant(ctx context.Context, id, tenantKey string, accountID, inboxID int) (*Session, error) {
+	m.createMu.Lock()
+	defer m.createMu.Unlock()
+
+	session, ok := m.Get(id)
+	if !ok {
+		return nil, errSessionNotFound
+	}
+	session.mu.Lock()
+	defer session.mu.Unlock()
+	if session.tenantKey == tenantKey && session.accountID == accountID && session.inboxID == inboxID {
+		return session, nil
+	}
+	if session.tenantKey != "" || session.accountID != 0 || session.inboxID != 0 {
+		return nil, errSessionTenantConflict
+	}
+	claimed, err := m.store.claimTenant(ctx, id, tenantKey, accountID, inboxID)
+	if err != nil || !claimed {
+		return nil, errSessionTenantConflict
+	}
+	session.tenantKey = tenantKey
+	session.accountID = accountID
+	session.inboxID = inboxID
+	return session, nil
 }
 
 func (m *SessionManager) infos() []SessionInfo {
@@ -141,6 +197,10 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 		}
 		client := whatsmeow.NewClient(device, m.waLogger)
 		s := newSession(m, row.ID, row.Name, client)
+		s.tenantKey = row.TenantKey
+		s.accountID = row.AccountID
+		s.inboxID = row.InboxID
+		s.pairingExpiresAt = row.PairingExpiresAt
 		s.waContainer = container
 		s.waDB = db
 		s.setWebhook(parseStoredWebhook(row.Webhook))
@@ -166,9 +226,35 @@ func (m *SessionManager) Restore(ctx context.Context) error {
 	return nil
 }
 
-func (m *SessionManager) Create(name string) (string, error) {
+func (m *SessionManager) Create(params SessionCreateParams) (string, error) {
+	m.createMu.Lock()
+	defer m.createMu.Unlock()
+	if params.IdempotencyKey != "" {
+		if id, err := m.store.findByIdempotency(m.appCtx, params.IdempotencyKey); err != nil {
+			return "", err
+		} else if id != "" {
+			if _, ok := m.Get(id); ok {
+				return id, nil
+			}
+			return "", fmt.Errorf("idempotent session %s is not loaded", id)
+		}
+	}
+	if params.TenantKey != "" {
+		m.mu.RLock()
+		for _, existing := range m.sessions {
+			if existing.tenantKey == params.TenantKey {
+				id := existing.id
+				m.mu.RUnlock()
+				return id, nil
+			}
+		}
+		m.mu.RUnlock()
+	}
 	id := newSessionID()
-	if err := m.store.insert(m.appCtx, id, name); err != nil {
+	if params.Name == "" {
+		params.Name = "Session"
+	}
+	if err := m.store.insert(m.appCtx, id, params); err != nil {
 		return "", err
 	}
 	container, db, err := m.db.openSessionContainer(m.appCtx, id)
@@ -179,7 +265,11 @@ func (m *SessionManager) Create(name string) (string, error) {
 	}
 	device := container.NewDevice()
 	client := whatsmeow.NewClient(device, m.waLogger)
-	s := newSession(m, id, name, client)
+	s := newSession(m, id, params.Name, client)
+	s.tenantKey = params.TenantKey
+	s.accountID = params.AccountID
+	s.inboxID = params.InboxID
+	s.pairingExpiresAt = params.PairingExpiresAt
 	s.waContainer = container
 	s.waDB = db
 	m.register(s)
@@ -188,7 +278,7 @@ func (m *SessionManager) Create(name string) (string, error) {
 		m.log.Error("start pairing failed", "session", id, "err", err)
 		return "", fmt.Errorf("start pairing: %w", err)
 	}
-	m.log.Info("session created", "session", id, "name", name)
+	m.log.Info("session created", "session", id, "name", params.Name, "tenant", params.TenantKey)
 	return id, nil
 }
 
@@ -261,5 +351,23 @@ func (m *SessionManager) disconnectAll() {
 	m.mu.RUnlock()
 	for _, s := range all {
 		s.shutdown()
+	}
+}
+
+func (m *SessionManager) cleanupExpiredPairings(ctx context.Context) {
+	now := time.Now()
+	m.mu.RLock()
+	ids := []string{}
+	for _, session := range m.sessions {
+		info := session.info()
+		if !info.Paired && info.PairingExpiresAt != nil && !info.PairingExpiresAt.After(now) {
+			ids = append(ids, session.id)
+		}
+	}
+	m.mu.RUnlock()
+	for _, id := range ids {
+		if err := m.Delete(ctx, id); err != nil {
+			m.log.Warn("expired pairing cleanup failed", "session", id, "err", err)
+		}
 	}
 }

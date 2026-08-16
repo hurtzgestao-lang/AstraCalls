@@ -35,10 +35,14 @@ type Session struct {
 	waContainer *sqlstore.Container
 	waDB        *sql.DB
 
-	mu       sync.Mutex
-	auth     AuthSnapshot
-	webhook  WebhookConfig
-	chatwoot ChatwootConfig
+	mu               sync.Mutex
+	auth             AuthSnapshot
+	webhook          WebhookConfig
+	chatwoot         ChatwootConfig
+	tenantKey        string
+	accountID        int
+	inboxID          int
+	pairingExpiresAt *time.Time
 }
 
 func (s *Session) setWebhook(config WebhookConfig) {
@@ -117,6 +121,8 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 			rec.StartedAt = existing.StartedAt
 			rec.ConnectedAt = existing.ConnectedAt
 			rec.Phone = existing.Phone
+			rec.Metadata = existing.Metadata
+			rec.IdempotencyKey = existing.IdempotencyKey
 		}
 		if rec.Status == StatusConnected && rec.ConnectedAt == nil {
 			now := time.Now().UnixMilli()
@@ -159,14 +165,40 @@ func (s *Session) wireCall(cm *call.CallManager, callID string) {
 	}
 }
 
-func (s *Session) startOutgoing(ctx context.Context, peer types.JID, isVideo, shouldRecord bool) (string, error) {
-	callID := signaling.GenerateCallID()
+func (s *Session) startOutgoing(ctx context.Context, callID string, peer types.JID, isVideo, shouldRecord bool) error {
 	cm := s.createCall(callID, shouldRecord)
 	if err := cm.StartCall(ctx, callID, peer, isVideo); err != nil {
 		s.removeCall(callID)
-		return "", err
+		return err
 	}
-	return callID, nil
+	return nil
+}
+
+func (s *Session) waitOutgoingOffer(callID string, timeout time.Duration) CallStatus {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if ac, ok := s.reg.get(callID); ok {
+			if current := ac.cm.CurrentCall(); current != nil {
+				status := mapStatus(current.StateData.State)
+				if status != StatusStarting {
+					return status
+				}
+			}
+		} else {
+			return StatusEnded
+		}
+
+		select {
+		case <-deadline.C:
+			return StatusStarting
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Session) callForEvent(from types.JID, data *waBinary.Node) (*activeCall, bool) {
@@ -210,8 +242,13 @@ func (s *Session) handleEvent(rawEvt any) {
 	switch evt := rawEvt.(type) {
 	case *events.Connected:
 		if id := s.client.Store.ID; id != nil {
+			if !s.mgr.jidAvailable(s.id, id.String()) {
+				s.rejectDuplicatePairing(ctx)
+				return
+			}
 			_ = s.mgr.store.setJID(s.mgr.appCtx, s.id, id.String())
 		}
+		s.clearPairingExpiry()
 		s.setAuth(AuthSnapshot{State: "open", Paired: true})
 	case *events.LoggedOut:
 		s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
@@ -269,8 +306,13 @@ func (s *Session) startPairing(ctx context.Context) error {
 				s.mgr.broker.emitSessionQR(s.id, evt.Code)
 			case "success":
 				if id := s.client.Store.ID; id != nil {
+					if !s.mgr.jidAvailable(s.id, id.String()) {
+						s.rejectDuplicatePairing(context.Background())
+						continue
+					}
 					_ = s.mgr.store.setJID(s.mgr.appCtx, s.id, id.String())
 				}
+				s.clearPairingExpiry()
 				s.setAuth(AuthSnapshot{State: "open", Paired: true})
 			case "timeout":
 				s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
@@ -291,12 +333,39 @@ func (s *Session) setAuth(a AuthSnapshot) {
 func (s *Session) info() SessionInfo {
 	s.mu.Lock()
 	a := s.auth
+	tenantKey := s.tenantKey
+	accountID := s.accountID
+	inboxID := s.inboxID
+	pairingExpiresAt := s.pairingExpiresAt
 	s.mu.Unlock()
 	jid := ""
 	if id := s.client.Store.ID; id != nil {
-		jid = id.String()
+		jid = sessionInfoJID(*id)
 	}
-	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != ""}
+	return SessionInfo{ID: s.id, Name: s.name, JID: jid, State: a.State, Paired: a.Paired || jid != "", QR: a.QR,
+		TenantKey: tenantKey, AccountID: accountID, InboxID: inboxID, PairingExpiresAt: pairingExpiresAt}
+}
+
+func (s *Session) clearPairingExpiry() {
+	s.mu.Lock()
+	s.pairingExpiresAt = nil
+	s.mu.Unlock()
+}
+
+func (s *Session) rejectDuplicatePairing(ctx context.Context) {
+	s.log.Warn("duplicate WhatsApp identity rejected")
+	if s.client.Store.ID != nil {
+		_ = s.client.Logout(ctx)
+	}
+	_ = s.mgr.store.setJID(s.mgr.appCtx, s.id, "")
+	s.setAuth(AuthSnapshot{State: "duplicate_phone", Paired: false})
+}
+
+func sessionInfoJID(jid types.JID) string {
+	if jid.User == "" || jid.Server == "" {
+		return jid.String()
+	}
+	return jid.User + "@" + jid.Server
 }
 
 func (s *Session) setBridge(callID string, b *Bridge, oc media.Codec) {

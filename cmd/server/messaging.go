@@ -234,11 +234,23 @@ func (s *server) handleSetWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	config := WebhookConfig{URL: strings.TrimSpace(b.URL), Secret: b.Secret, Events: b.Events}
+	if config.URL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url required"})
+		return
+	}
 	if config.Secret == "" {
 		config.Secret = sess.getWebhook().Secret
 	}
 	sess.setWebhook(config)
-	_ = sess.mgr.store.setWebhook(r.Context(), sess.id, config.storedValue())
+	if err := sess.mgr.store.setWebhook(r.Context(), sess.id, config.storedValue()); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "unable to persist webhook"})
+		return
+	}
+	sess.dispatchWebhook("webhook.verified", map[string]any{
+		"tenant_key": sess.tenantKey,
+		"account_id": sess.accountID,
+		"inbox_id":   sess.inboxID,
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"webhook": config.URL, "events": config.Events})
 }
 

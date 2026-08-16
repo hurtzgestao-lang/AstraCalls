@@ -44,6 +44,7 @@ func main() {
 	// Padrão vem da env WACALLS_MAX_CALLS (fácil de editar na stack do Portainer);
 	// a flag -max-calls-per-session ainda sobrescreve se passada.
 	maxCalls := flag.Int("max-calls-per-session", envInt("WACALLS_MAX_CALLS", 8), "max concurrent calls per session (0 = unlimited)")
+	maxGlobalCalls := flag.Int("max-global-calls", envInt("WACALLS_GLOBAL_MAX_CALLS", 32), "max concurrent calls across all sessions (0 = unlimited)")
 	flag.Parse()
 
 	level := slog.LevelInfo
@@ -56,7 +57,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	srv, err := newServer(ctx, *pgURL, *pgNS, *staticDir, *maxCalls, log)
+	srv, err := newServer(ctx, *pgURL, *pgNS, *staticDir, *maxCalls, *maxGlobalCalls, log)
 	if err != nil {
 		log.Error("startup failed", "err", err)
 		os.Exit(1)
@@ -67,6 +68,7 @@ func main() {
 		log.Error("session restore failed", "err", err)
 		os.Exit(1)
 	}
+	srv.startWorkers(ctx)
 
 	httpSrv := &http.Server{Addr: *addr, Handler: srv.routes()}
 	go func() {

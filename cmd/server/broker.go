@@ -1,10 +1,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sync"
 	"time"
+)
+
+var (
+	errOperatorBusy         = errors.New("operator already on a call")
+	errSessionCapacity      = errors.New("session call capacity reached")
+	errGlobalCapacity       = errors.New("global call capacity reached")
+	errIdempotencyForbidden = errors.New("idempotency key belongs to another operator")
 )
 
 type CallStatus string
@@ -17,17 +26,19 @@ const (
 )
 
 type CallRecord struct {
-	SessionID   string     `json:"sessionId"`
-	CallID      string     `json:"callId"`
-	Owner       *string    `json:"owner"`
-	Direction   string     `json:"direction"`
-	Peer        string     `json:"peer"`
-	Phone       string     `json:"phone,omitempty"`
-	StartedAt   int64      `json:"startedAt"`
-	ConnectedAt *int64     `json:"connectedAt,omitempty"`
-	Status      CallStatus `json:"status"`
-	EndedAt     *int64     `json:"endedAt,omitempty"`
-	EndReason   string     `json:"endReason,omitempty"`
+	SessionID      string         `json:"sessionId"`
+	CallID         string         `json:"callId"`
+	Owner          *string        `json:"owner"`
+	Direction      string         `json:"direction"`
+	Peer           string         `json:"peer"`
+	Phone          string         `json:"phone,omitempty"`
+	StartedAt      int64          `json:"startedAt"`
+	ConnectedAt    *int64         `json:"connectedAt,omitempty"`
+	Status         CallStatus     `json:"status"`
+	EndedAt        *int64         `json:"endedAt,omitempty"`
+	EndReason      string         `json:"endReason,omitempty"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
+	IdempotencyKey string         `json:"-"`
 }
 
 type AuthSnapshot struct {
@@ -37,11 +48,16 @@ type AuthSnapshot struct {
 }
 
 type SessionInfo struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	JID    string `json:"jid"`
-	State  string `json:"state"`
-	Paired bool   `json:"paired"`
+	ID               string     `json:"id"`
+	Name             string     `json:"name"`
+	JID              string     `json:"jid"`
+	State            string     `json:"state"`
+	Paired           bool       `json:"paired"`
+	QR               string     `json:"qr,omitempty"`
+	TenantKey        string     `json:"tenant_key,omitempty"`
+	AccountID        int        `json:"account_id,omitempty"`
+	InboxID          int        `json:"inbox_id,omitempty"`
+	PairingExpiresAt *time.Time `json:"pairing_expires_at,omitempty"`
 }
 
 type subscriber struct {
@@ -54,8 +70,21 @@ type Broker struct {
 	subs    map[*subscriber]struct{}
 	calls   map[string]*CallRecord
 	history []CallRecord
+	store   *runtimeStore
 
 	SnapshotFn func() []any
+}
+
+func (b *Broker) setRuntimeStore(store *runtimeStore) {
+	b.mu.Lock()
+	b.store = store
+	b.mu.Unlock()
+}
+
+func (b *Broker) runtimeStore() *runtimeStore {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	return b.store
 }
 
 func NewBroker() *Broker {
@@ -114,7 +143,93 @@ func (b *Broker) upsertCall(r CallRecord) {
 	b.mu.Lock()
 	cp := r
 	b.calls[r.CallID] = &cp
+	store := b.store
 	b.mu.Unlock()
+	if store != nil {
+		if err := store.upsertCall(context.Background(), r); err != nil {
+			store.log.Error("persisting call failed", "call_id", r.CallID, "err", err)
+		}
+	}
+	b.broadcastCall(r)
+}
+
+func (b *Broker) reserveOutgoingCall(r CallRecord, sessionLimit, globalLimit int) (*CallRecord, bool, string, error) {
+	b.mu.Lock()
+	for _, call := range b.calls {
+		if r.IdempotencyKey != "" && call.SessionID == r.SessionID && call.IdempotencyKey == r.IdempotencyKey {
+			if call.Owner == nil || r.Owner == nil || *call.Owner != *r.Owner {
+				b.mu.Unlock()
+				return nil, false, call.CallID, errIdempotencyForbidden
+			}
+			copy := *call
+			b.mu.Unlock()
+			return &copy, true, "", nil
+		}
+	}
+	if b.store != nil && r.IdempotencyKey != "" {
+		existing, err := b.store.callByIdempotency(context.Background(), r.SessionID, r.IdempotencyKey)
+		if err != nil {
+			b.mu.Unlock()
+			return nil, false, "", err
+		}
+		if existing != nil {
+			if existing.Owner == nil || r.Owner == nil || *existing.Owner != *r.Owner {
+				b.mu.Unlock()
+				return nil, false, existing.CallID, errIdempotencyForbidden
+			}
+			b.mu.Unlock()
+			return existing, true, "", nil
+		}
+	}
+
+	activeTotal := 0
+	activeSession := 0
+	for _, call := range b.calls {
+		if call.Status == StatusEnded {
+			continue
+		}
+		activeTotal++
+		if call.SessionID == r.SessionID {
+			activeSession++
+		}
+		if call.Owner != nil && r.Owner != nil && *call.Owner == *r.Owner {
+			conflictID := call.CallID
+			b.mu.Unlock()
+			return nil, false, conflictID, errOperatorBusy
+		}
+	}
+	if sessionLimit > 0 && activeSession >= sessionLimit {
+		b.mu.Unlock()
+		return nil, false, "", errSessionCapacity
+	}
+	if globalLimit > 0 && activeTotal >= globalLimit {
+		b.mu.Unlock()
+		return nil, false, "", errGlobalCapacity
+	}
+
+	if b.store != nil {
+		reserved, reused, err := b.store.reserveCall(context.Background(), r)
+		if err != nil {
+			b.mu.Unlock()
+			return nil, false, "", err
+		}
+		if reused {
+			if reserved.Owner == nil || r.Owner == nil || *reserved.Owner != *r.Owner {
+				b.mu.Unlock()
+				return nil, false, reserved.CallID, errIdempotencyForbidden
+			}
+			b.mu.Unlock()
+			return reserved, true, "", nil
+		}
+	}
+	copy := r
+	b.calls[r.CallID] = &copy
+	b.mu.Unlock()
+	b.broadcastCall(r)
+	return &copy, false, "", nil
+}
+
+func (b *Broker) broadcastCall(r CallRecord) {
 	b.broadcastCallList()
 	b.broadcast(map[string]any{
 		"type": "call-status", "sessionId": r.SessionID, "id": r.CallID, "owner": r.Owner,
@@ -147,6 +262,16 @@ func (b *Broker) setOwner(id, owner string) bool {
 	return true
 }
 
+func (b *Broker) ownerMatches(id, owner string) bool {
+	if owner == "" {
+		return false
+	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	c, ok := b.calls[id]
+	return ok && c.Owner != nil && *c.Owner == owner
+}
+
 func (b *Broker) ownerActiveCall(owner string) string {
 	if owner == "" {
 		return ""
@@ -159,6 +284,35 @@ func (b *Broker) ownerActiveCall(owner string) string {
 		}
 	}
 	return ""
+}
+
+func (b *Broker) activeCallCount() int {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	count := 0
+	for _, call := range b.calls {
+		if call.Status != StatusEnded {
+			count++
+		}
+	}
+	return count
+}
+
+func (b *Broker) claimOrAuthorize(id, owner string) bool {
+	if owner == "" {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	call, ok := b.calls[id]
+	if !ok {
+		return false
+	}
+	if call.Owner != nil && *call.Owner != owner {
+		return false
+	}
+	call.Owner = &owner
+	return true
 }
 
 func (b *Broker) endCall(id, reason string) {
@@ -177,7 +331,13 @@ func (b *Broker) endCall(id, reason string) {
 	b.history = append(b.history, ended)
 	owner := c.Owner
 	sessionID := c.SessionID
+	store := b.store
 	b.mu.Unlock()
+	if store != nil {
+		if err := store.upsertCall(context.Background(), ended); err != nil {
+			store.log.Error("persisting ended call failed", "call_id", id, "err", err)
+		}
+	}
 
 	b.broadcast(map[string]any{
 		"type": "call-ended", "sessionId": sessionID, "id": id, "owner": owner, "reason": reason, "endedAt": now,
@@ -206,6 +366,16 @@ func (b *Broker) emitIncomingClaimed(sessionID, id, owner string) {
 }
 
 func (b *Broker) historyRows(sessionID string, limit int) []CallRecord {
+	b.mu.RLock()
+	store := b.store
+	b.mu.RUnlock()
+	if store != nil {
+		if rows, err := store.historyRows(context.Background(), sessionID, limit); err == nil {
+			return rows
+		} else {
+			store.log.Error("loading call history failed", "session", sessionID, "err", err)
+		}
+	}
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	rows := make([]CallRecord, 0, limit)

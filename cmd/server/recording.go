@@ -57,6 +57,7 @@ type RecordingWebhookData struct {
 	EndReason      string         `json:"end_reason,omitempty"`
 	Recording      *RecordingInfo `json:"recording,omitempty"`
 	RecordingError string         `json:"recording_error,omitempty"`
+	Metadata       map[string]any `json:"metadata,omitempty"`
 }
 
 type CallRecorder struct {
@@ -373,16 +374,30 @@ func (s *Session) dispatchRecordingReady(record CallRecord, info *RecordingInfo,
 		EndedAt:     record.EndedAt,
 		EndReason:   record.EndReason,
 		Recording:   info,
+		Metadata:    record.Metadata,
 	}
 	body, err := json.Marshal(map[string]any{
+		"event_id":  newEventID(),
 		"session":   s.id,
 		"event":     "recording.ready",
 		"timestamp": time.Now().UnixMilli(),
 		"data":      data,
 	})
 	if err != nil {
-		_ = os.RemoveAll(filepath.Dir(filePath))
+		s.log.Error("recording webhook serialization failed", "call_id", record.CallID, "err", err)
 		return
+	}
+	var envelope struct {
+		EventID string `json:"event_id"`
+	}
+	_ = json.Unmarshal(body, &envelope)
+	if s.mgr != nil && s.mgr.broker != nil {
+		if store := s.mgr.broker.runtimeStore(); store != nil {
+			if _, err := store.enqueueWebhook(context.Background(), envelope.EventID, s.id, "recording.ready", time.Now().UnixMilli(), body, config, filePath, info); err != nil {
+				s.log.Error("queueing recording webhook failed", "call_id", record.CallID, "event_id", envelope.EventID, "err", err)
+			}
+			return
+		}
 	}
 	go func() {
 		defer func() {
@@ -425,6 +440,7 @@ func (s *Session) dispatchRecordingFailed(record CallRecord, err error) {
 		EndedAt:        record.EndedAt,
 		EndReason:      record.EndReason,
 		RecordingError: err.Error(),
+		Metadata:       record.Metadata,
 	})
 }
 
