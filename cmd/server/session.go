@@ -316,6 +316,11 @@ func (s *Session) startPairing(ctx context.Context) error {
 				s.setAuth(AuthSnapshot{State: "open", Paired: true})
 			case "timeout":
 				s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
+			default:
+				// err-client-outdated, err-unexpected-state and similar end the pairing; surface them
+				// instead of leaving the session stuck in "connecting".
+				s.log.Warn("pairing stopped", "event", evt.Event, "err", evt.Error)
+				s.setAuth(AuthSnapshot{State: "logged_out", Paired: false})
 			}
 		}
 	}()

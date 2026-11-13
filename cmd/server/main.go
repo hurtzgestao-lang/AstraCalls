@@ -57,6 +57,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	keepWAVersionFresh(ctx, log)
+
 	srv, err := newServer(ctx, *pgURL, *pgNS, *staticDir, *maxCalls, *maxGlobalCalls, log)
 	if err != nil {
 		log.Error("startup failed", "err", err)
